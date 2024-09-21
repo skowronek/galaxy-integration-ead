@@ -27,6 +27,8 @@ class CookieJar(aiohttp.CookieJar):
 
 class AuthenticatedHttpClient(HttpClient):
     def __init__(self):
+        self._client_id = "JUNO_PC_CLIENT"
+        self._client_secret = "4mRLtYMb6vq9qglomWEaT4ChxsXWcyqbQpuBNfMPOYOiDmYYQmjuaBsF2Zp0RyVeWkfqhE9TuGgAw7te"
         self._auth_lost_callback = None
         self._cookie_jar = CookieJar()
         self._access_token = None
