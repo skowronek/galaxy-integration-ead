@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import pathlib
 import json
@@ -25,6 +26,7 @@ from galaxy.api.types import (
 from backend import MasterTitleId, OfferId, EABackendClient, Timestamp, AchievementSet, Json
 from http_client import AuthenticatedHttpClient
 from lgames_manifests import get_install_location, get_state_changes, parse_total_size, process_iter
+from pcsign_hash import PCSign, PCSignVersion
 from uri_scheme_handler import is_uri_handler_installed
 from version import __version__
 import re
@@ -36,24 +38,8 @@ def is_windows():
     return platform.system().lower() == "windows"
 
 LOCAL_GAMES_CACHE_VALID_PERIOD = 5
-AUTH_PARAMS = {
-    "window_title": "Login to EA Desktop",
-    "window_width": 495 if is_windows() else 480,
-    "window_height": 746 if is_windows() else 708,
-    "start_uri": "https://accounts.ea.com/connect/auth"
-                 "?response_type=code&client_id=EADOTCOM-WEB-SERVER&display=junoWeb/login"
-                 "&locale=en_US&release_type=prod"
-                 "&redirect_uri=https://www.ea.com/ea-play",
-    "end_uri_regex": r"^https://www\.ea\.com/ea-play.*"
-}
 def regex_pattern(regex):
     return ".*" + re.escape(regex) + ".*"
-
-JS = {regex_pattern(r"juno/login?execution"): [
-r'''
-    document.getElementById("rememberMe").checked = true;
-'''
-]}
 
 MultiplayerId = NewType("MultiplayerId", str)
 GameId = NewType("GameId", str)  # eg. Origin.OFR:12345 or Origin.OFR:12345@epic
@@ -176,11 +162,31 @@ class EAPlugin(Plugin):
         if not self._http_client.is_authenticated():
             logger.exception("Plugin not authenticated")
             raise AuthenticationRequired()
+        
+    async def _begin_auth_flow(self):
+        pc_sign_definition = PCSign(sv=PCSignVersion.V2)
+        pc_sign = pc_sign_definition.generate_pc_sign()
+        params = {
+            "window_title": "Login to EA Desktop",
+            "window_width": 495 if is_windows() else 480,
+            "window_height": 746 if is_windows() else 708,
+            "start_uri": "https://accounts.ea.com/connect/auth"
+                        "?response_type=code&client_id=JUNO_PC_CLIENT&display=junoClient/login"
+                        "&redirect_uri=qrc:///html/login_successful.html"
+                        "&locale=en_US&pc_sign={}".format(pc_sign),
+            "end_uri_regex": "qrc:/html/login_successful.html.*"
+        }
+        script = {regex_pattern(r"juno/login?execution"): [
+            r'''
+                document.getElementById("rememberMe").checked = true;
+            '''
+        ]}
+        return NextStep("web_session", params, js=script)
 
     async def authenticate(self, stored_credentials=None):
         stored_cookies = stored_credentials.get("cookies") if stored_credentials else None
         if not stored_cookies:
-            return NextStep("web_session", AUTH_PARAMS, js=JS)
+            return _begin_auth_flow()
         return await self._do_authenticate(stored_cookies)
 
     async def pass_login_credentials(self, step, credentials, cookies):
