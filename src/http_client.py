@@ -6,7 +6,7 @@ from aiohttp import ClientSession, CookieJar
 from galaxy.http import HttpClient
 from yarl import URL
 
-from galaxy.api.errors import AccessDenied, AuthenticationRequired
+from galaxy.api.errors import AccessDenied, AuthenticationRequired, BackendError, NetworkError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -83,69 +83,89 @@ class AuthenticatedHttpClient(HttpClient):
             response.raise_for_status()
             return await response.json()
 
-    async def _exchange_code_for_token(self, code):
+    async def _exchange_code_for_token(self, code: str):
         token_url = "https://accounts.ea.com/connect/token"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        token_params = {
+            "token_format": "JWS",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "grant_type": "authorization_code",
+            "redirect_uri": "qrc:///html/login_successful.html",
+            "code": code
         }
-        token_params = f"client_id=JUNO_PC_CLIENT&client_secret=4mRLtYMb6vq9qglomWEaT4ChxsXWcyqbQpuBNfMPOYOiDmYYQmjuaBsF2Zp0RyVeWkfqhE9TuGgAw7te&grant_type=authorization_code&code={code}"
         try:
-            async with self._session.post(token_url, headers=headers, params=token_params) as token_response:
-                token_response_json = await token_response.json()
-                if "access_token" in token_response_json:
-                    self._access_token = token_response_json["access_token"]
-                    self._refresh_token = token_response_json["refresh_token"]
-                    return self._access_token, self._refresh_token
-                elif token_response_json.get('error') == "invalid_request":
-                    self._log_session_details()
-                    raise AuthenticationRequired("Error parsing access token. Must reauthenticate.")
-                else:
-                    raise AccessDenied("Unexpected response when exchanging code for token")
+            async with self._session.post(token_url, headers=headers, data=token_params) as response:
+                response.raise_for_status()
+                response_data = await response.json()
+            
+            if "access_token" not in response_data or "refresh_token" not in response_data:
+                logger.error(f"Invalid token response: {response_data}")
+                raise BackendError("Failed to exchange code for tokens: Invalid response")
+            
+            self._access_token = response_data["access_token"]
+            self._refresh_token = response_data["refresh_token"]
+            self._save_lats()
+            
+            logger.info("Successfully exchanged code for tokens")
+            return self._access_token, self._refresh_token
+        except aiohttp.ClientError as e:
+            logger.exception(f"Network error while exchanging code for tokens: {str(e)}")
+            raise NetworkError("Failed to exchange code for tokens due to network error")
         except Exception as e:
-            logger.exception(f"Error in _exchange_code_for_token: {str(e)}")
-            raise
+            logger.exception(f"Unexpected error while exchanging code for tokens: {str(e)}")
+            raise BackendError("Unexpected error while exchanging code for tokens")
 
     async def _refresh_access_token(self):
+        if self._refresh_token is None:
+            raise AuthenticationRequired("No refresh token available")
+        
         url = "https://accounts.ea.com/connect/token"
-        params = f"client_id=JUNO_PC_CLIENT&client_secret=4mRLtYMb6vq9qglomWEaT4ChxsXWcyqbQpuBNfMPOYOiDmYYQmjuaBsF2Zp0RyVeWkfqhE9TuGgAw7te&grant_type=refresh_token&refresh_token={self._refresh_token}"
-        async with self._session.post(url, params=params, allow_redirects=False) as response:
-            response_json = await response.json()
-            if "access_token" in response_json:
-                self._access_token = response_json["access_token"]
-                self._refresh_token = response_json["refresh_token"]
-                return self._access_token, self._refresh_token
-            elif response_json.get('error') == "invalid_request":
-                self._log_session_details()
-                raise AuthenticationRequired("Error refreshing access token. Must reauthenticate.")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        params = {
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token
+        }
+        try:
+            async with self._session.post(url, headers=headers, data=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+            
+            if "access_token" in data and "refresh_token" in data:
+                self._access_token = data["access_token"]
+                self._refresh_token = data["refresh_token"]
+                self._save_lats()
+            else:
+                raise BackendError("Failed to refresh token: Invalid response")
+        except aiohttp.ClientError as e:
+            logger.warning(f"Network error while refreshing token: {str(e)}")
+            raise NetworkError("Failed to refresh token due to network error")
+        except Exception as e:
+            logger.exception(f"Failed to refresh token: {str(e)}")
+            self._access_token = None
+            self._refresh_token = None
+            raise AccessDenied("Failed to refresh token")
 
     async def _get_access_token(self):
         url = "https://accounts.ea.com/connect/auth"
         params = {
-            "client_id": "JUNO_PC_CLIENT",
+            "client_id": self._client_id,
             "display": "junoWeb/login",
             "response_type": "code",
             "redirectUri": "nucleus:rest"
         }
-        try:
-            async with self._session.get(url, params=params, allow_redirects=False) as response:
-                if "Location" not in response.headers:
-                    logger.error("No Location header in response")
-                    raise AccessDenied("No Location header in response")
+        async with self._session.get(url, params=params, allow_redirects=False) as response:
+            if "Location" in response.headers:
                 location = response.headers["Location"]
-                if "code" in location:
-                    data = location
-                    code = data.split("?")[1].split("=")[1]
-                    return await self._exchange_code_for_token(code)
-                elif "code" not in location and "error=login_required" in location:
+                if "code=" in location:
+                    return location.split("code=")[1].split("&")[0]
+                elif "error=login_required" in location:
                     self._log_session_details()
-                    raise AuthenticationRequired("Error parsing code. Must reauthenticate.")
-                else:
-                    raise AccessDenied("Unexpected response when getting access token")
-        except Exception as e:
-            logger.exception(f"Error in _get_access_token: {str(e)}")
-            raise
-            
-    # more logging for auth lost investigation
+                    raise AuthenticationRequired("Error obtaining authorization code. Must reauthenticate.")
+            self._save_lats()
+            raise BackendError("Unexpected response during authorization")
 
     def _save_lats(self):
         if self._save_lats_callback is not None:

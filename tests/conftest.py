@@ -62,7 +62,6 @@ def create_xml_response():
 @pytest.fixture
 def backend_client():
     mock = MagicMock(spec=())
-    mock.get_identity = AsyncMock()
     mock.get_offer = AsyncMock()
     mock.get_entitlements = AsyncMock()
     mock.get_game_time = AsyncMock()
