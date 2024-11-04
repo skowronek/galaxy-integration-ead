@@ -1,4 +1,5 @@
 import asyncio
+import urllib.parse
 import base64
 import os
 import pathlib
@@ -26,6 +27,7 @@ from galaxy.api.types import (
 from backend import MasterTitleId, OfferId, EABackendClient, Timestamp, AchievementSet, Json
 from http_client import AuthenticatedHttpClient
 from lgames_manifests import get_install_location, get_state_changes, parse_total_size, process_iter
+import lgames_manifests
 from pcsign_hash import PCSign, PCSignVersion
 from uri_scheme_handler import is_uri_handler_installed
 from version import __version__
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 def is_windows():
     return platform.system().lower() == "windows"
 
-LOCAL_GAMES_CACHE_VALID_PERIOD = 5
+LOCAL_GAMES_CACHE_VALID_PERIOD = 3600  # 1 hour
 def regex_pattern(regex):
     return ".*" + re.escape(regex) + ".*"
 
@@ -59,15 +61,13 @@ class GameLibrarySettingsContext(NamedTuple):
 class EAPlugin(Plugin):
     def __init__(self, reader, writer, token):
         super().__init__(Platform.Origin, __version__, reader, writer, token)
+        self._load_stored_credentials()
         self._user_id = None
         self._persona_id = None
-
-        def auth_lost():
-            self.lost_authentication()
+        self._access_token = None
+        self._refresh_token = None
 
         self._http_client = AuthenticatedHttpClient()
-        self._http_client.set_auth_lost_callback(auth_lost)
-        self._http_client.set_cookies_updated_callback(self._update_stored_cookies)
         self._backend_client = EABackendClient(self._http_client)
         self._persistent_cache_updated = False
 
@@ -82,61 +82,82 @@ class EAPlugin(Plugin):
     @property
     def _offer_id_cache(self) -> Dict[OfferId, Json]:
         return self.persistent_cache.setdefault("offers", {})
+
+    def _load_stored_credentials(self):
+        creds = self.persistent_cache.get('credentials')
+        if creds:
+            self._access_token = creds.get('access_token')
+            self._refresh_token = creds.get('refresh_token')
     
     
     def _update_local_games(self):
         local_games = []
 
-        running_processes = set(exe for _, exe in process_iter() if exe)
+        def normalize_path(path):
+            return os.path.normpath(path.lower()) if path else None
 
-        def is_game_running(game_exe):
-            return any(game_exe in exe for exe in running_processes)
+        def get_install_location(game_data):
+            locations = []
+            # Check primary install location overrides
+            if game_data.get("installCheckOverride"):
+                locations.append(game_data["installCheckOverride"])
+            if game_data.get("executePathOverride"):
+                locations.append(game_data["executePathOverride"])
+                
+            # Process registry paths
+            for location in locations:
+                try:
+                    if '[' in location and ']' in location:
+                        regkey_path, part = location.split(']')
+                        regkey_parts = regkey_path.strip('[').split("\\")
+                        
+                        if len(regkey_parts) >= 2:
+                            hive = getattr(winreg, regkey_parts[0])
+                            reg_path = "\\".join(regkey_parts[1:-1])
+                            reg_key = regkey_parts[-1]
+                            
+                            install_path = lgames_manifests.get_install_location(hive, reg_path, reg_key)
+                            if install_path and os.path.exists(install_path):
+                                return install_path
+                    elif os.path.exists(location):
+                        return location
+                except Exception as e:
+                    logger.debug(f"Failed to process install location {location}: {e}")
+            return None
+
+        def is_game_running(game_name):
+            if not game_name:
+                return False
+                
+            # Get list of running processes
+            running_processes = set(exe.lower() for _, exe in process_iter() if exe)
+            game_name = game_name.lower()
+            
+            # Check different possible process name formats
+            check_names = [
+                game_name,
+                os.path.splitext(game_name)[0],  # Without extension
+                f"{game_name}.exe",
+                f"{os.path.splitext(game_name)[0]}.exe"
+            ]
+            
+            return any(proc_name in running_processes for proc_name in check_names)
 
         if self._offer_id_cache is None:
             self._get_owned_offers()
 
         for offer_id, game_data in self._offer_id_cache.items():
             state = LocalGameState.None_
-            regkey_full = None
-            if ("installCheckOverride" in game_data and 
-                game_data["installCheckOverride"] is not None and 
-                game_data["installCheckOverride"] != "" and 
-                game_data["installCheckOverride"].endswith(".exe")):
-                regkey_full = game_data["installCheckOverride"]
-            elif ("executePathOverride" in game_data and 
-                game_data["executePathOverride"] is not None and 
-                game_data["executePathOverride"] != "" and 
-                game_data["executePathOverride"].endswith(".exe")):
-                regkey_full = game_data["executePathOverride"]
-            else:
-                regkey_full = None
+            install_location = get_install_location(game_data)
 
-            if regkey_full:
-                regkey_path, part = regkey_full.split(']')
-                game_name = regkey_full.split(']')[1].split('\\')[-1]
-                regkey_path = regkey_path.replace('[', '')
-                regkey_parts = regkey_path.split("\\")
-                if len(regkey_parts) < 2:
-                    logger.error(f"Invalid registry key format: {regkey_full}")
-                    continue
-
-                hive = getattr(winreg, regkey_parts[0]) # Convert hive to integer
-                regkey_path = "\\".join(regkey_parts[1:-1]) # Join the rest of the path excluding the last part
-                part = regkey_parts[-1] # The last part of the path is the part you want to get the value of
-
-                install_location = get_install_location(hive, regkey_path, part)
-
-                if install_location:
-                    # get last part of the registry now that we have the install location to trigger the last part of the registry
-                    if os.path.exists(install_location):
-                        state = LocalGameState.Installed
-                        if is_game_running(game_name):
-                            state = LocalGameState.Installed | LocalGameState.Running
-                    local_games.append(LocalGame(offer_id, state))
-                else:
-                    local_games.append(LocalGame(offer_id, state))
-            else:
-                local_games.append(LocalGame(offer_id, state))
+            if install_location:
+                game_name = os.path.basename(install_location)
+                state = LocalGameState.Installed
+                
+                if is_game_running(game_name):
+                    state |= LocalGameState.Running
+                    
+            local_games.append(LocalGame(offer_id, state))
 
         return local_games
     
@@ -151,18 +172,31 @@ class EAPlugin(Plugin):
 
         return self._local_games, notify_list
         
-
     async def shutdown(self):
         await self._http_client.close()
 
     def tick(self):
         self.handle_local_game_update_notifications()
 
-    def _check_authenticated(self):
-        if not self._http_client.is_authenticated():
-            logger.exception("Plugin not authenticated")
+    async def _check_authenticated(self):
+        if not self._access_token or not self._refresh_token:
             raise AuthenticationRequired()
+
+    async def authenticate(self, stored_credentials=None):
+        if stored_credentials:
+            self._refresh_token = stored_credentials.get('refresh_token')
+            if self._refresh_token:
+                try:
+                    # Force refresh the token every time
+                    await self._force_refresh_access_token()
+                    return await self._get_user_info()
+                except Exception as e:
+                    logging.error(f"Failed to refresh token: {e}")
+                    # Clear invalid refresh token
+                    self._refresh_token = None
         
+        return await self._begin_auth_flow()
+
     async def _begin_auth_flow(self):
         pc_sign_definition = PCSign(sv=PCSignVersion.V2)
         pc_sign = pc_sign_definition.generate_pc_sign()
@@ -182,34 +216,71 @@ class EAPlugin(Plugin):
             '''
         ]}
         return NextStep("web_session", params, js=script)
+    
+    async def _force_refresh_access_token(self):
+        try:
+            self._access_token, self._refresh_token = await self._http_client._refresh_access_token(self._refresh_token)
+            self.store_credentials({
+                'refresh_token': self._refresh_token
+            })
+            # Don't store access_token in persistent storage
+        except Exception as e:
+            logging.error(f"Failed to refresh token: {e}")
+            raise AuthenticationRequired()
 
-    async def authenticate(self, stored_credentials=None):
-        stored_cookies = stored_credentials.get("cookies") if stored_credentials else None
-        if not stored_cookies:
-            return _begin_auth_flow()
-        return await self._do_authenticate(stored_cookies)
+    def _store_tokens(self, access_token, refresh_token):
+        self.store_credentials({
+            "access_token": access_token,
+            "refresh_token": refresh_token
+        })
+
+    async def _get_user_info(self):
+        payload = self._decode_jwt_payload(self._access_token)
+        self._user_id = payload['nexus']["pid"]
+        user_name = payload['nexus']["psif"][0]["dis"]
+        self._persona_id = payload['nexus']["psid"]
+        return Authentication(self._user_id, user_name)
+
+    def _decode_jwt_payload(self, token):
+        _, payload, _ = token.split('.')
+        padding = '=' * (4 - len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload + padding).decode('utf-8'))
+
+    async def _refresh_access_token(self):
+        self._access_token, self._refresh_token = await self._http_client._refresh_access_token(self._refresh_token)
+        self._store_tokens(self._access_token, self._refresh_token)
+
+    def _extract_code_from_uri(self, uri):
+        parsed_uri = urllib.parse.urlparse(uri)
+        query_params = urllib.parse.parse_qs(parsed_uri.query)
+        
+        if 'code' in query_params:
+            return query_params['code'][0]
+        else:
+            raise AuthenticationRequired("No authorization code found in redirect URI")
 
     async def pass_login_credentials(self, step, credentials, cookies):
-        new_cookies = {cookie["name"]: cookie["value"] for cookie in cookies}
-        auth_info = await self._do_authenticate(new_cookies)
-        self._store_cookies(new_cookies)
-        return auth_info
+        logger.debug("Passing login credentials: step {}, credentials {}, cookies {}".format(step, credentials, cookies))
+        auth_code = self._extract_code_from_uri(credentials["end_uri"])
+        return await self._do_authenticate(auth_code)
 
-    async def _do_authenticate(self, cookies):
+    async def _do_authenticate(self, auth_code):
         try:
             logger.info("Starting authentication process")
-            await self._http_client.authenticate(cookies)
-            logger.info("HTTP client authenticated")
-            
-            self._access_token, self._refresh_token = await self._http_client._get_access_token()
+            self._access_token, self._refresh_token = await self._http_client._exchange_code_for_token(auth_code)
             logger.info("Access token obtained")
             
             if not self._access_token:
-                logger.error("Access token not set after _get_access_token")
+                logger.error("Access token not set after _exchange_code_for_token")
                 raise AccessDenied("No access token obtained")
             
-            self._user_id, self._persona_id, user_name = await self._backend_client.get_identity()
-            logger.info(f"Identity obtained: user_id={self._user_id}, persona_id={self._persona_id}, user_name={user_name}")
+            user_info = self._decode_jwt_payload(self._access_token)["nexus"]
+            self._user_id = user_info["pid"]
+            user_name = user_info["psif"][0]["dis"]
+            self._persona_id = user_info["psid"]
+            logger.info(f"Identity obtained: user_id={self._user_id}, user_name={user_name}, persona_id={self._persona_id}")
+            
+            self._store_tokens(self._access_token, self._refresh_token)
             
             return Authentication(self._user_id, user_name)
         except (AccessDenied, InvalidCredentials, AuthenticationRequired) as e:
@@ -311,23 +382,27 @@ class EAPlugin(Plugin):
         return offers
     
     async def _get_owned_offers(self) -> Dict[GameId, Json]:
+        await self._check_authenticated()
+
         def get_game_id(entitlement: Json) -> GameId:
             offer_id = entitlement["originOfferId"]
-            external_type = entitlement["product"]["gameProductUser"]["ownershipMethods"][0]
-            if external_type == "STEAM":
-                return GameId(f"{offer_id}@steam")
-            elif external_type == "EPIC":
-                return GameId(f"{offer_id}@epic")
-            else: 
-                return GameId(offer_id)
+            external_type = entitlement.get("product", {}).get("gameProductUser", {}).get("ownershipMethods", [None])[0]
+            return GameId(f"{offer_id}@{external_type.lower()}" if external_type in ["STEAM", "EPIC"] else offer_id)
+
+        def is_valid_game(entitlement: Json) -> bool:
+            if not entitlement.get("product"):
+                return False
+            game_type = entitlement["product"].get("baseItem", {}).get("gameType")
+            # Include BASE_GAME and EXPANSION types, exclude DLC and VIRTUAL_CURRENCY
+            return game_type in ["BASE_GAME", "EXPANSION"]
 
         entitlement_data = await self._backend_client.get_entitlements()
-        basegame_entitlements = [x for x in entitlement_data if x["product"] is not None and x["product"]["baseItem"]["gameType"] == "BASE_GAME"]
-        basegame_offers = await self._get_offers([x["originOfferId"] for x in basegame_entitlements])
+        valid_entitlements = [x for x in entitlement_data if is_valid_game(x)]
+        basegame_offers = await self._get_offers([x["originOfferId"] for x in valid_entitlements])
 
         return {
             get_game_id(ent): basegame_offers[ent["originOfferId"]]
-            for ent in basegame_entitlements
+            for ent in valid_entitlements
             if ent["originOfferId"] in basegame_offers
         }
 
@@ -498,6 +573,7 @@ class EAPlugin(Plugin):
         self._store_cookies(cookies)
 
     async def get_local_games(self) -> List[LocalGame]:
+        await self._check_authenticated()
         if self._local_games_update_in_progress:
             logger.debug("Local games are being updated, returning cached values")
             return self._local_games.local_games
@@ -536,47 +612,42 @@ class EAPlugin(Plugin):
         loop = asyncio.get_running_loop()
         asyncio.create_task(notify_local_games_changed())
 
-    async def prepare_local_size_context(self, game_ids: List[GameId]) -> Dict[str, pathlib.PurePath]:
-        game_id_crc_map: Dict[GameId, str] = {}
-        for game_id in game_ids: 
+    async def prepare_local_size_context(self, game_ids: List[str]) -> Dict[str, Optional[pathlib.Path]]:
+        game_id_crc_map: Dict[str, Optional[pathlib.Path]] = {}
+        
+        for game_id in game_ids:
             game = self._offer_id_cache.get(self._offer_id_from_game_id(game_id))
-            if ("installCheckOverride" in game and 
-                game["installCheckOverride"] is not None and 
-                game["installCheckOverride"] != "" and 
-                game["installCheckOverride"].endswith(".exe")):
-                regkey_full = game["installCheckOverride"]
-            elif ("executePathOverride" in game and 
-                game["executePathOverride"] is not None and 
-                game["executePathOverride"] != "" and 
-                game["executePathOverride"].endswith(".exe")):
-                regkey_full = game["executePathOverride"]
-            else:
-                regkey_full = None
-
-            if regkey_full:
+            regkey_full = game.get("installCheckOverride") or game.get("executePathOverride")
+            
+            if not regkey_full:
+                game_id_crc_map[game_id] = None
+                continue
+            
+            try:
                 regkey_path, part = regkey_full.split(']')
-                game_name = regkey_full.split(']')[1].split('\\')[-1]
-                regkey_path = regkey_path.replace('[', '')
-                regkey_parts = regkey_path.split("\\")
+                game_name = part.split('\\')[-1]
+                regkey_parts = regkey_path.strip('[').split("\\")
+                
                 if len(regkey_parts) < 2:
-                    logger.error(f"Invalid registry key format: {regkey_full}")
-                    continue
-
-                hive = getattr(winreg, regkey_parts[0]) # Convert hive to integer
-                regkey_path = "\\".join(regkey_parts[1:-1]) # Join the rest of the path excluding the last part
-                part = regkey_parts[-1] # The last part of the path is the part you want to get the value of
-
+                    raise ValueError(f"Invalid registry key format: {regkey_full}")
+                
+                hive = getattr(winreg, regkey_parts[0])
+                regkey_path = "\\".join(regkey_parts[1:-1])
+                part = regkey_parts[-1]
+                
                 install_location = get_install_location(hive, regkey_path, part)
-
-                if install_location:
+                
+                if install_location and os.path.exists(install_location):
                     logger.info(f"Game file name: {game_name}")
                     logger.debug(f"Install location found: {install_location}")
-                    if os.path.exists(install_location):
-                        game_id_crc_map[game_id] = pathlib.Path(install_location)
-                    else:
-                        game_id_crc_map[game_id] = None
-            else:
+                    game_id_crc_map[game_id] = pathlib.Path(install_location)
+                else:
+                    game_id_crc_map[game_id] = None
+                    
+            except Exception as e:
+                logger.error(f"Error processing game {game_id}: {str(e)}")
                 game_id_crc_map[game_id] = None
+        
         return game_id_crc_map
 
     async def get_local_size(self, game_id: GameId, context: Dict[str, pathlib.PurePath]) -> Optional[int]:
@@ -631,7 +702,6 @@ class EAPlugin(Plugin):
 
 def main():
     create_and_run_plugin(EAPlugin, sys.argv)
-
 
 if __name__ == "__main__":
     main()

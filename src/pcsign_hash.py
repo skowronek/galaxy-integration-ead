@@ -44,10 +44,13 @@ class PCSign:
     def gather_hardware_info(self):
         if os.name == 'nt':  # Windows
             self.gather_windows_info()
-        elif os.name == 'posix':  # Linux/Unix
-            self.gather_linux_info()
+        elif os.name == 'posix':  # macOS/Linux
+            self.gather_macos_info()
         else:
             raise OSError("Unsupported operating system")
+
+    def run_wmic(self, command):
+        return subprocess.check_output(f"wmic {command}", shell=True).decode().split('\n')[1]
 
     def gather_windows_info(self):
         self.bsn = self.run_wmic("bios get serialnumber").strip()
@@ -56,17 +59,14 @@ class PCSign:
         self.msn = self.run_wmic("baseboard get serialnumber").strip()
         self.mac = self.run_wmic("nic where physicaladapter=true get macaddress").strip()
 
-    def gather_linux_info(self):
-        self.bsn = self.run_linux_command("sudo dmidecode -s system-serial-number")
-        self.gid = int(self.run_linux_command("lspci -nn | grep VGA").split('[')[1].split(':')[1].split(']')[0], 16)
-        self.hsn = self.run_linux_command("sudo hdparm -I /dev/sda | grep 'Serial Number'").split(':')[1].strip()
-        self.msn = self.run_linux_command("sudo dmidecode -s baseboard-serial-number")
-        self.mac = self.run_linux_command("ip link show | awk '/ether/ {print $2}' | head -n1")
+    def gather_macos_info(self):
+        self.bsn = self.run_macos_command("system_profiler SPHardwareDataType | awk '/Serial Number/' | cut -d: -f2").strip()
+        self.gid = int(self.run_macos_command("system_profiler SPDisplaysDataType | awk '/Device ID:/' | cut -d: -f2").strip(), 16)
+        self.hsn = self.run_macos_command("diskutil info /dev/disk0 | awk '/Device Identifier:/' | cut -d: -f2").strip()
+        self.msn = self.run_macos_command("system_profiler SPHardwareDataType | awk '/Hardware UUID:/' | cut -d: -f2").strip()
+        self.mac = self.run_macos_command("ifconfig en0 | awk '/ether/' | cut -d' ' -f2").strip()
 
-    def run_wmic(self, command):
-        return subprocess.check_output(f"wmic {command}", shell=True).decode().split('\n')[1]
-
-    def run_linux_command(self, command):
+    def run_macos_command(self, command):
         return subprocess.check_output(command, shell=True).decode().strip()
 
     @staticmethod

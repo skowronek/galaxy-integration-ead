@@ -10,6 +10,7 @@ else:
     import psutil
 from typing import Iterator, List, Optional, Set, Tuple
 import winreg
+import xml.etree.ElementTree as ET
 
 from galaxy.api.types import (
      LocalGame, LocalGameState
@@ -154,13 +155,52 @@ else:
                 logger.exception("Failed to get information for PID=%s" % pid)
 
 
-def get_install_location(base_key, regkey_path, part):
+def get_install_location(base_key=None, regkey_path=None, part=None):
+    """Get install location from registry or XML manifest
+    
+    Can be called with:
+    - Single argument (full path): get_install_location(full_path)  
+    - Three arguments (registry): get_install_location(base_key, regkey_path, part)
+    """
+    # If called with single argument, treat as full path
+    if regkey_path is None and part is None:
+        installer_path = os.path.join(os.path.dirname(os.path.dirname(base_key)), "__Installer", "installerdata.xml")
+        return parse_install_manifest(installer_path)
+
+    # Otherwise handle as registry lookup with fallback to XML
     try:
         with winreg.OpenKey(base_key, regkey_path) as key:
             install_location, _ = winreg.QueryValueEx(key, part)
-            return install_location
-    except FileNotFoundError:
+            if install_location and os.path.exists(install_location):
+                return install_location
+    except Exception as e:
+        logger.debug(f"Registry lookup failed: {str(e)}")
+
+    # Try XML manifest
+    try:
+        installer_path = os.path.join(os.path.dirname(os.path.dirname(regkey_path)), "__Installer", "installerdata.xml")
+        install_path = parse_install_manifest(installer_path)
+        if install_path and os.path.exists(install_path):
+            return install_path
+    except Exception as e:
+        logger.debug(f"XML manifest lookup failed: {str(e)}")
+
+    return None
+    
+def parse_install_manifest(installer_path: str) -> Optional[str]:
+    """Parse installerdata.xml to find the game install path"""
+    try:
+        if not os.path.exists(installer_path):
+            return None
+            
+        tree = ET.parse(installer_path)
+        root = tree.getroot()
+        
+        # Find DiPManifest/installManifest/filePath 
+        manifest = root.find(".//DiPManifest/installManifest/filePath")
+        if manifest is not None:
+            return manifest.text
         return None
     except Exception as e:
-        logger.error(f"Error accessing registry key {base_key}\\{regkey_path}: {str(e)}")
+        logger.error(f"Error parsing installer manifest: {str(e)}")
         return None

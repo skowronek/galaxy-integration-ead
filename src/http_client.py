@@ -34,46 +34,33 @@ class AuthenticatedHttpClient(HttpClient):
         self._access_token = None
         self._refresh_token = None
         self._last_access_token_success = None
-        self._save_last_callback = None
+        self._save_lats_callback = None
         self._session = ClientSession(cookie_jar=self._cookie_jar)
 
-    def set_auth_lost_callback(self, callback):
-        self._auth_lost_callback = callback
-
-    def set_cookies_updated_callback(self, callback):
-        self._cookie_jar.set_cookies_updated_callback(callback)
-
-    async def authenticate(self, cookies):
-        self._cookie_jar.update_cookies(cookies)
-        if self._last_access_token_success < int(time.time()) - 259199:
-            await self._refresh_access_token()
-        else:
-            await self._get_access_token()
-
-    def is_authenticated(self):
-        return self._access_token is not None
-
-    async def get(self, *args, **kwargs):
+    def _check_authenticated(self):
         if not self._access_token:
-            raise AccessDenied("No access token")
-        try:
-            return await self._authorized_get(*args, **kwargs)
-        except (AuthenticationRequired, AccessDenied):
-            await self._refresh_token()
-            return await self._authorized_get(*args, **kwargs)
-        
-    async def post(self, *args, **kwargs):
-        if not self._access_token:
-            raise AccessDenied("No access token")
-        try:
-            return await self._authorized_post(*args, **kwargs)
-        except (AuthenticationRequired, AccessDenied):
-            await self._refresh_token()
-            return await self._authorized_post(*args, **kwargs)
+            raise AuthenticationRequired()
+
+    async def get(self, url, *args, **kwargs):
+        headers = kwargs.setdefault("headers", {})
+        headers["Authorization"] = f"Bearer {self._access_token}"
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
+        async with self._session.get(url, *args, **kwargs) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def post(self, url, *args, **kwargs):
+        headers = kwargs.setdefault("headers", {})
+        headers["Authorization"] = f"Bearer {self._access_token}"
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
+        async with self._session.post(url, *args, **kwargs) as response:
+            response.raise_for_status()
+            return await response.json()
 
     async def _authorized_get(self, url, *args, **kwargs):
         headers = kwargs.setdefault("headers", {})
         headers["Authorization"] = "Bearer {}".format(self._access_token)
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
         async with self._session.get(url, *args, **kwargs) as response:
             response.raise_for_status()
             return await response.json()
@@ -81,6 +68,7 @@ class AuthenticatedHttpClient(HttpClient):
     async def _authorized_post(self, url, *args, **kwargs):
         headers = kwargs.setdefault("headers", {})
         headers["Authorization"] = "Bearer {}".format(self._access_token)
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
         async with self._session.post(url, *args, **kwargs) as response:
             response.raise_for_status()
             return await response.json()
@@ -118,8 +106,8 @@ class AuthenticatedHttpClient(HttpClient):
             logger.exception(f"Unexpected error while exchanging code for tokens: {str(e)}")
             raise BackendError("Unexpected error while exchanging code for tokens")
 
-    async def _refresh_access_token(self):
-        if self._refresh_token is None:
+    async def _refresh_access_token(self, refresh_token: str):
+        if not refresh_token:
             raise AuthenticationRequired("No refresh token available")
         
         url = "https://accounts.ea.com/connect/token"
@@ -128,9 +116,10 @@ class AuthenticatedHttpClient(HttpClient):
             "client_id": self._client_id,
             "client_secret": self._client_secret,
             "grant_type": "refresh_token",
-            "refresh_token": self._refresh_token
+            "refresh_token": refresh_token
         }
         try:
+            logger.info("Using stored credentials to refresh the access token...")
             async with self._session.post(url, headers=headers, data=params) as response:
                 response.raise_for_status()
                 data = await response.json()
@@ -138,9 +127,12 @@ class AuthenticatedHttpClient(HttpClient):
             if "access_token" in data and "refresh_token" in data:
                 self._access_token = data["access_token"]
                 self._refresh_token = data["refresh_token"]
+                logger.info("Successfully refreshed the access token.")
                 self._save_lats()
+                return self._access_token, self._refresh_token
             else:
                 raise BackendError("Failed to refresh token: Invalid response")
+
         except aiohttp.ClientError as e:
             logger.warning(f"Network error while refreshing token: {str(e)}")
             raise NetworkError("Failed to refresh token due to network error")
@@ -148,6 +140,8 @@ class AuthenticatedHttpClient(HttpClient):
             logger.exception(f"Failed to refresh token: {str(e)}")
             self._access_token = None
             self._refresh_token = None
+            if self._auth_lost_callback:
+                self._auth_lost_callback()
             raise AccessDenied("Failed to refresh token")
 
     async def _get_access_token(self):
@@ -192,3 +186,6 @@ class AuthenticatedHttpClient(HttpClient):
             )
         except Exception as e:
             logger.warning('Failed to get session duration: %s', repr(e))
+
+    def set_auth_lost_callback(self, callback):
+        self._auth_lost_callback = callback

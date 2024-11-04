@@ -1,7 +1,15 @@
-__version__ = "0.43"
+__version__ = "0.44"
 
 __changelog__ = {
     "unreleased":"""""",
+    "0.44":
+    """
+        - using EA Desktop's login page instead of the web one (integrate pc_sign creation and usage) [Kudos to @imLinguin for the help and information]
+        - rewrote the HTTP client & backend to make it more modular, and simple to maintain
+        - added a token refresh method (credentials should last WAY longer)
+        - rewrote the plugin to add the new methods, cleanup
+        - few fixes related to game discovery and status
+    """,
     "0.43":
     """
         - rewrote the login process to get a long-lasting token, with a token refresh method. Kudos to @imLinguin for the help and information
