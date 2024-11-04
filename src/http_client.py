@@ -37,41 +37,27 @@ class AuthenticatedHttpClient(HttpClient):
         self._save_lats_callback = None
         self._session = ClientSession(cookie_jar=self._cookie_jar)
 
-    def _check_authenticated(self):
-        if not self._access_token:
-            raise AuthenticationRequired()
+    def _get_default_headers(self):
+        """Common headers for all requests"""
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
+        }
 
-    async def get(self, url, *args, **kwargs):
+    async def _request(self, method: str, url: str, *args, **kwargs) -> dict:
+        """Generic request handler"""
         headers = kwargs.setdefault("headers", {})
-        headers["Authorization"] = f"Bearer {self._access_token}"
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
-        async with self._session.get(url, *args, **kwargs) as response:
-            response.raise_for_status()
-            return await response.json()
-
-    async def post(self, url, *args, **kwargs):
-        headers = kwargs.setdefault("headers", {})
-        headers["Authorization"] = f"Bearer {self._access_token}"
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
-        async with self._session.post(url, *args, **kwargs) as response:
+        headers.update(self._get_default_headers())
+        
+        async with self._session.request(method, url, *args, **kwargs) as response:
             response.raise_for_status()
             return await response.json()
 
-    async def _authorized_get(self, url, *args, **kwargs):
-        headers = kwargs.setdefault("headers", {})
-        headers["Authorization"] = "Bearer {}".format(self._access_token)
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
-        async with self._session.get(url, *args, **kwargs) as response:
-            response.raise_for_status()
-            return await response.json()
-    
-    async def _authorized_post(self, url, *args, **kwargs):
-        headers = kwargs.setdefault("headers", {})
-        headers["Authorization"] = "Bearer {}".format(self._access_token)
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
-        async with self._session.post(url, *args, **kwargs) as response:
-            response.raise_for_status()
-            return await response.json()
+    async def get(self, url, *args, **kwargs):
+        return await self._request("GET", url, *args, **kwargs)
+
+    async def post(self, url, *args, **kwargs): 
+        return await self._request("POST", url, *args, **kwargs)
 
     async def _exchange_code_for_token(self, code: str):
         token_url = "https://accounts.ea.com/connect/token"

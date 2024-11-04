@@ -26,8 +26,7 @@ from galaxy.api.types import (
 
 from backend import MasterTitleId, OfferId, EABackendClient, Timestamp, AchievementSet, Json
 from http_client import AuthenticatedHttpClient
-from lgames_manifests import get_install_location, get_state_changes, parse_total_size, process_iter
-import lgames_manifests
+from lgames_manifests import get_install_location_rkeyxml, get_state_changes, parse_total_size, process_iter
 from pcsign_hash import PCSign, PCSignVersion
 from uri_scheme_handler import is_uri_handler_installed
 from version import __version__
@@ -116,7 +115,7 @@ class EAPlugin(Plugin):
                             reg_path = "\\".join(regkey_parts[1:-1])
                             reg_key = regkey_parts[-1]
                             
-                            install_path = lgames_manifests.get_install_location(hive, reg_path, reg_key)
+                            install_path = get_install_location_rkeyxml(hive, reg_path, reg_key)
                             if install_path and os.path.exists(install_path):
                                 return install_path
                     elif os.path.exists(location):
@@ -635,7 +634,7 @@ class EAPlugin(Plugin):
                 regkey_path = "\\".join(regkey_parts[1:-1])
                 part = regkey_parts[-1]
                 
-                install_location = get_install_location(hive, regkey_path, part)
+                install_location = get_install_location_rkeyxml(hive, regkey_path, part)
                 
                 if install_location and os.path.exists(install_location):
                     logger.info(f"Game file name: {game_name}")

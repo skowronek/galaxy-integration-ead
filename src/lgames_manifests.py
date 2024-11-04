@@ -155,7 +155,7 @@ else:
                 logger.exception("Failed to get information for PID=%s" % pid)
 
 
-def get_install_location(base_key=None, regkey_path=None, part=None):
+def get_install_location_rkeyxml(base_key=None, regkey_path=None, part=None):
     """Get install location from registry or XML manifest
     
     Can be called with:
