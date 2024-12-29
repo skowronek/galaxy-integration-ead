@@ -1,7 +1,10 @@
-from asyncio.log import logger
-from enum import Flag
 import os
 import platform
+import winreg
+import xml.etree.ElementTree as ET
+import logging
+from asyncio.log import logger
+from enum import Flag
 if platform.system() == "Windows":
     from ctypes import byref, sizeof, windll, create_unicode_buffer, FormatError, WinError
     from ctypes.wintypes import DWORD
@@ -9,8 +12,6 @@ if platform.system() == "Windows":
 else:
     import psutil
 from typing import Iterator, List, Optional, Set, Tuple
-import winreg
-import xml.etree.ElementTree as ET
 
 from galaxy.api.types import (
      LocalGame, LocalGameState

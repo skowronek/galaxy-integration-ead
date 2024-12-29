@@ -296,13 +296,14 @@ class EAPlugin(Plugin):
         owned_offers = await self._get_owned_offers()
         games = []
         for game_id, offer in owned_offers.items():
-            if game_id is not None:
-                game = Game(
-                    game_id,
-                    offer["displayName"],
-                    None,
-                    LicenseInfo(LicenseType.SinglePurchase, None)
-                )
+            if game_id and offer is not None:
+                if "displayName" in offer or "i18n" in offer:
+                    game = Game(
+                        game_id,
+                        offer.get("displayName") or offer["i18n"].get("displayName"),
+                        None,
+                        LicenseInfo(LicenseType.SinglePurchase, None)
+                    )
                 games.append(game)
 
         return games
@@ -433,7 +434,7 @@ class EAPlugin(Plugin):
         def get_cached_game_times(_game_id: GameId, _lastplayed_time: Optional[Timestamp]) -> Optional[GameTime]:
             """"returns None if a new entry should be retrieved"""
             if _lastplayed_time is None:
-                # double-check if 'lastplayed_time' is unknown (maybe it was just to long ago)
+                # double-check if 'lastplayed_time' is unknown (maybe it was just too long ago)
                 return None
 
             _cached_game_time: GameTime = self._game_time_cache.get(_game_id)
@@ -474,7 +475,11 @@ class EAPlugin(Plugin):
             if offer is None:
                 logger.exception("Internal cache out of sync")
                 raise UnknownError()
-            game_slug = GameSlug(offer["gameSlug"])
+            if "gameSlug" in offer:
+                game_slug = GameSlug(offer["gameSlug"])
+            else:
+                # Specific case in which offer data's in the other format
+                game_slug = GameSlug(offer["gameNameFacetKey"])
 
             return await self._get_game_times_for_master_title(
                 game_id,

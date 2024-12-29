@@ -56,13 +56,13 @@ class PCSign:
             return ""
 
     def _gather_windows_info(self):
-        bsn = self._run_cmd("wmic bios get serialnumber").splitlines()[1].strip()
-        gpu_line = self._run_cmd("wmic path win32_videocontroller get pnpdeviceid").splitlines()[1]
+        bsn = self._run_cmd("powershell -Command \"(Get-CimInstance -ClassName Win32_BIOS).SerialNumber\"").strip()
+        gpu_line = self._run_cmd("powershell -Command \"(Get-CimInstance -ClassName Win32_VideoController).PNPDeviceID\"").strip()
         gid = int(gpu_line.split('DEV_')[1].split('&')[0], 16) if "DEV_" in gpu_line else 0
-        hsn = self._run_cmd("wmic diskdrive get serialnumber").splitlines()[1].strip()
-        msn = self._run_cmd("wmic baseboard get serialnumber").splitlines()[1].strip()
-        mac_line = self._run_cmd("wmic nic where physicaladapter=true get macaddress").splitlines()
-        mac = mac_line[1].strip() if len(mac_line) > 1 else None
+        hsn = self._run_cmd("powershell -Command \"(Get-CimInstance -ClassName Win32_DiskDrive).SerialNumber\"").strip()
+        msn = self._run_cmd("powershell -Command \"(Get-CimInstance -ClassName Win32_BaseBoard).SerialNumber\"").strip()
+        mac_line = self._run_cmd("powershell -Command \"(Get-CimInstance -ClassName Win32_NetworkAdapter | Where-Object {$_.PhysicalAdapter}) | Select-Object -First 1 -ExpandProperty MACAddress\"").strip()
+        mac = mac_line if mac_line else None
         return bsn, gid, hsn, msn, mac
 
     def _gather_macos_info(self):

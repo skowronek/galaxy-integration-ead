@@ -266,7 +266,7 @@ class EABackendClient:
         }
 
         query = """
-        query($tier: String!) {
+        query($tier: LifecycleType!) {
             gameSearch(filter: {gameTypes: [BASE_GAME], productLifecycleFilter: {lifecycleTypes: [$tier]}}, paging: {limit: 9999}) {
                 items {
                     slug
@@ -276,24 +276,31 @@ class EABackendClient:
         """
         data = await self._make_graphql_request(query, {"tier": tier_mapping[tier]})
         slugs = [game['slug'] for game in data['gameSearch']['items']]
+        max_batch_size = 50
+        all_games = []
 
-        query = """
-        query($slugs: [String!]!) {
-            games(slugs: $slugs) {
-                items {
-                    slug
-                    products {
-                        items {
-                            id
-                            name
-                            originOfferId
+        for i in range(0, len(slugs), max_batch_size):
+            batch_slugs = slugs[i:i + max_batch_size]
+            query = """
+            query($slugs: [String!]!) {
+                games(slugs: $slugs) {
+                    items {
+                        slug
+                        products {
+                            items {
+                                id
+                                name
+                                originOfferId
+                            }
                         }
                     }
                 }
             }
-        }
-        """
-        games = await self._make_graphql_request(query, {"slugs": slugs})
+            """
+            batch_games = await self._make_graphql_request(query, {"slugs": batch_slugs})
+            all_games.extend(batch_games['games']['items'])
+
+        games = {'games': {'items': all_games}}
 
         subscription_games = []
         for game in games['games']['items']:

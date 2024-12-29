@@ -11,7 +11,7 @@ from galaxy.api.errors import AccessDenied, AuthenticationRequired, BackendError
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class CookieJar(aiohttp.CookieJar):
+class CustomCookieJar(aiohttp.CookieJar):
     def __init__(self):
         super().__init__()
         self._cookies_updated_callback = None
@@ -30,7 +30,7 @@ class AuthenticatedHttpClient(HttpClient):
         self._client_id = "JUNO_PC_CLIENT"
         self._client_secret = "4mRLtYMb6vq9qglomWEaT4ChxsXWcyqbQpuBNfMPOYOiDmYYQmjuaBsF2Zp0RyVeWkfqhE9TuGgAw7te"
         self._auth_lost_callback = None
-        self._cookie_jar = CookieJar()
+        self._cookie_jar = CustomCookieJar()
         self._access_token = None
         self._refresh_token = None
         self._last_access_token_success = None
