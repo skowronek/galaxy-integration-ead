@@ -60,7 +60,8 @@ class EABackendClient:
         }
         """
         data = await self._make_graphql_request(query)
-        return data['me']['ownedGameProducts']['items']
+        items = data['me']['ownedGameProducts']['items']
+        return [item for item in items if item['product'] is not None]
 
     async def get_offer(self, offer_id: OfferId) -> Json:
         query = """
@@ -96,10 +97,10 @@ class EABackendClient:
         data = await self._make_graphql_request(query, {"offerId": str(offer_id)})
         return data['legacyOffers'][0], data['gameProducts']['items'][0]
 
-    async def get_achievements(self, offer: OfferId, persona: str) -> Dict[str, List[Achievement]]:
+    async def _fetch_achievements(self, offer: OfferId, persona: str, show_hidden: bool = False) -> Json:
         query = """
-        query($offerId: String!, $playerPsd: String!) {
-            achievements(offerId: $offerId, playerPsd: $playerPsd, showHidden: true) {
+        query($offerId: String!, $playerPsd: String!, $showHidden: Boolean!) {
+            achievements(offerId: $offerId, playerPsd: $playerPsd, showHidden: $showHidden) {
                 id
                 achievements {
                     id
@@ -110,7 +111,11 @@ class EABackendClient:
             }
         }
         """
-        data = await self._make_graphql_request(query, {"offerId": str(offer), "playerPsd": str(persona)})
+        data = await self._make_graphql_request(query, {"offerId": str(offer), "playerPsd": str(persona), "showHidden": show_hidden})
+        return data
+
+    async def get_achievements(self, offer: OfferId, persona: str) -> Dict[str, List[Achievement]]:
+        data = await self._fetch_achievements(offer, persona, show_hidden=True)
 
         def parse_achievements(json_data: Dict) -> List[Achievement]:
             achievements = []
@@ -133,14 +138,7 @@ class EABackendClient:
         return achievement_sets
 
     async def get_achievement_set(self, offer_id: OfferId, persona_id: str) -> Optional[str]:
-        query = """
-        query($offerId: String!, $playerPsd: String!) {
-            achievements(offerId: $offerId, playerPsd: $playerPsd) {
-                id
-            }
-        }
-        """
-        data = await self._make_graphql_request(query, {"offerId": str(offer_id), "playerPsd": str(persona_id)})
+        data = await self._fetch_achievements(offer_id, persona_id, show_hidden=False)
         
         achievements = data["achievements"]
         return achievements[0]["id"] if achievements and "id" in achievements[0] else None

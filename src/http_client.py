@@ -59,9 +59,21 @@ class AuthenticatedHttpClient(HttpClient):
     async def post(self, url, *args, **kwargs): 
         return await self._request("POST", url, *args, **kwargs)
 
-    async def _exchange_code_for_token(self, code: str):
-        token_url = "https://accounts.ea.com/connect/token"
+    async def _token_request(self, data):
+        url = "https://accounts.ea.com/connect/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            async with self._session.post(url, headers=headers, data=data) as response:
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientError as e:
+            logger.exception(f"Network error while requesting token: {str(e)}")
+            raise NetworkError("Failed to request token due to network error")
+        except Exception as e:
+            logger.exception(f"Unexpected error while requesting token: {str(e)}")
+            raise BackendError("Unexpected error while requesting token")
+
+    async def _exchange_code_for_token(self, code: str):
         token_params = {
             "token_format": "JWS",
             "client_id": self._client_id,
@@ -71,9 +83,7 @@ class AuthenticatedHttpClient(HttpClient):
             "code": code
         }
         try:
-            async with self._session.post(token_url, headers=headers, data=token_params) as response:
-                response.raise_for_status()
-                response_data = await response.json()
+            response_data = await self._token_request(token_params)
             
             if "access_token" not in response_data or "refresh_token" not in response_data:
                 logger.error(f"Invalid token response: {response_data}")
@@ -96,8 +106,6 @@ class AuthenticatedHttpClient(HttpClient):
         if not refresh_token:
             raise AuthenticationRequired("No refresh token available")
         
-        url = "https://accounts.ea.com/connect/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         params = {
             "client_id": self._client_id,
             "client_secret": self._client_secret,
@@ -106,9 +114,7 @@ class AuthenticatedHttpClient(HttpClient):
         }
         try:
             logger.info("Using stored credentials to refresh the access token...")
-            async with self._session.post(url, headers=headers, data=params) as response:
-                response.raise_for_status()
-                data = await response.json()
+            data = await self._token_request(params)
             
             if "access_token" in data and "refresh_token" in data:
                 self._access_token = data["access_token"]

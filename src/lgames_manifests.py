@@ -24,14 +24,11 @@ class EAGameState(Flag):
     Playable = 2
 
 def parse_total_size(filepath) -> int:
-    # get folder size
-    total_size = 0
-    if filepath is not None:
-        for dirpath, _, filenames in os.walk(filepath):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                total_size += os.path.getsize(fp)
-    return total_size
+    if not filepath:
+        return 0
+    return sum(os.path.getsize(os.path.join(dirpath, f))
+               for dirpath, _, filenames in os.walk(filepath)
+               for f in filenames)
 
 
 def get_state_changes(old_list, new_list):
@@ -156,12 +153,7 @@ else:
 
 
 def get_install_location_rkeyxml(base_key=None, regkey_path=None, part=None):
-    """Get install location from registry or XML manifest
-    
-    Can be called with:
-    - Single argument (full path): get_install_location(full_path)  
-    - Three arguments (registry): get_install_location(base_key, regkey_path, part)
-    """
+    """Get install location from registry or XML manifest"""
     # If called with single argument, treat as full path
     if regkey_path is None and part is None:
         installer_path = os.path.join(os.path.dirname(os.path.dirname(base_key)), "__Installer", "installerdata.xml")
