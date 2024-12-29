@@ -92,6 +92,9 @@ class EAPlugin(Plugin):
     def _update_local_games(self):
         local_games = []
 
+        def normalize_path(path):
+            return os.path.normpath(path.lower()) if path else None
+
         def get_install_location(game_data):
             locations = []
             # Check primary install location overrides
@@ -183,7 +186,8 @@ class EAPlugin(Plugin):
             self._refresh_token = stored_credentials.get('refresh_token')
             if self._refresh_token:
                 try:
-                    await self._refresh_access_token(force=True)
+                    # Force refresh the token every time
+                    await self._force_refresh_access_token()
                     return await self._get_user_info()
                 except Exception as e:
                     logging.error(f"Failed to refresh token: {e}")
@@ -212,10 +216,8 @@ class EAPlugin(Plugin):
         ]}
         return NextStep("web_session", params, js=script)
     
-    async def _refresh_access_token(self, force=False):
+    async def _force_refresh_access_token(self):
         try:
-            if force:
-                logging.info("Forcing token refresh")
             self._access_token, self._refresh_token = await self._http_client._refresh_access_token(self._refresh_token)
             self.store_credentials({
                 'refresh_token': self._refresh_token
@@ -257,6 +259,7 @@ class EAPlugin(Plugin):
             raise AuthenticationRequired("No authorization code found in redirect URI")
 
     async def pass_login_credentials(self, step, credentials, cookies):
+        logger.debug("Passing login credentials: step {}, credentials {}, cookies {}".format(step, credentials, cookies))
         auth_code = self._extract_code_from_uri(credentials["end_uri"])
         return await self._do_authenticate(auth_code)
 
@@ -291,7 +294,6 @@ class EAPlugin(Plugin):
         self._check_authenticated()
 
         owned_offers = await self._get_owned_offers()
-        logger.debug(f"Owned games: {owned_offers}")
         games = []
         for game_id, offer in owned_offers.items():
             if game_id is not None:
@@ -348,7 +350,11 @@ class EAPlugin(Plugin):
         offers = {}
         missing_offers = []
         for offer_id in offer_ids:
-            missing_offers.append(offer_id)
+            offer = self._offer_id_cache.get(offer_id, None)
+            if offer is not None:
+                offers[offer_id] = offer
+            else:
+                missing_offers.append(offer_id)
 
         # request for missing offers
         if missing_offers:
@@ -383,8 +389,11 @@ class EAPlugin(Plugin):
             return GameId(f"{offer_id}@{external_type.lower()}" if external_type in ["STEAM", "EPIC"] else offer_id)
 
         def is_valid_game(entitlement: Json) -> bool:
+            if not entitlement.get("product"):
+                return False
             game_type = entitlement["product"].get("baseItem", {}).get("gameType")
-            return game_type in ["BASE_GAME"]
+            # Include BASE_GAME and EXPANSION types, exclude DLC and VIRTUAL_CURRENCY
+            return game_type in ["BASE_GAME", "EXPANSION"]
 
         entitlement_data = await self._backend_client.get_entitlements()
         valid_entitlements = [x for x in entitlement_data if is_valid_game(x)]
