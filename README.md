@@ -11,7 +11,7 @@ As the data vary from the Juno API to the now almost defunct Origin API, some fe
 
 ## Installation
 
-MAKE SURE GOG GALAXY IS CLOSED BEFORE PROCEEDING TO THE INSTALLATION. Please note that for the "install.bat" file to work (in it's current state), you will need to have Python 3.7 (and pip) installed. Why 3.7 you may ask ? Because Galaxy uses that particular version, and certain dependencies will only work in said version.
+*MAKE SURE GOG GALAXY IS CLOSED BEFORE PROCEEDING TO THE INSTALLATION. Please note that for the "install.bat" file to work (in it's current state), you will need to have Python 3.7 (and pip) installed. Why 3.7 you may ask ? Because Galaxy uses that particular version, and certain dependencies will only work in said version.*
 
 1. Download the plugin from the releases page.
 2. Unzip the archive.
