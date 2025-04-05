@@ -1,17 +1,22 @@
 import logging
 import time
-from typing import Optional
+import asyncio
+from typing import Optional, Dict, Any, Callable
 import aiohttp
-from aiohttp import ClientSession, CookieJar
+from aiohttp import ClientSession, CookieJar, ClientTimeout
 from galaxy.http import HttpClient
 from yarl import URL
-
 from galaxy.api.errors import AccessDenied, AuthenticationRequired, BackendError, NetworkError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class CustomCookieJar(aiohttp.CookieJar):
+# HTTP request timeout and retry configuration
+DEFAULT_TIMEOUT = 30  # seconds
+MAX_RETRIES = 3
+RETRY_BACKOFF = 1.5  # exponential backoff multiplier
+
+class CustomCookieJar(CookieJar):
     def __init__(self):
         super().__init__()
         self._cookies_updated_callback = None
@@ -24,7 +29,6 @@ class CustomCookieJar(aiohttp.CookieJar):
         if cookies and self._cookies_updated_callback:
             self._cookies_updated_callback(list(self))
 
-
 class AuthenticatedHttpClient(HttpClient):
     def __init__(self):
         self._client_id = "JUNO_PC_CLIENT"
@@ -35,23 +39,130 @@ class AuthenticatedHttpClient(HttpClient):
         self._refresh_token = None
         self._last_access_token_success = None
         self._save_lats_callback = None
-        self._session = ClientSession(cookie_jar=self._cookie_jar)
+        self._token_lock = asyncio.Lock()
+        
+        # Use optimized ClientSession settings
+        timeout = ClientTimeout(total=DEFAULT_TIMEOUT)
+        connector = aiohttp.TCPConnector(
+            limit=20,  # Allow more parallel connections
+            force_close=False,  # Keep connections alive
+            enable_cleanup_closed=True,  # Clean up closed connections
+            ttl_dns_cache=300  # Cache DNS results for 5 minutes
+        )
+        
+        self._session = ClientSession(
+            cookie_jar=self._cookie_jar,
+            timeout=timeout,
+            connector=connector,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
+            }
+        )
+        
+        # Request cache for GET requests
+        self._request_cache = {}
+        self._cache_timestamps = {}
+        self._cache_expiry = 300  # 5 minutes
 
     def _get_default_headers(self):
         """Common headers for all requests"""
-        return {
-            "Authorization": f"Bearer {self._access_token}",
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Origin/10.6.0.00000 EAApp/13.301.0.5814 Chrome/109.0.5414.120 Safari/537.36"
         }
+        
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+            
+        return headers
 
     async def _request(self, method: str, url: str, *args, **kwargs) -> dict:
-        """Generic request handler"""
+        """
+        Generic request handler with retry logic and caching for GET requests
+        """
+        # Check cache for GET requests
+        if method.upper() == "GET":
+            cache_key = f"{url}:{str(kwargs.get('params', ''))}"
+            current_time = time.time()
+            
+            if cache_key in self._request_cache:
+                if current_time - self._cache_timestamps[cache_key] < self._cache_expiry:
+                    logger.debug(f"Using cached response for {url}")
+                    return self._request_cache[cache_key]
+                
         headers = kwargs.setdefault("headers", {})
         headers.update(self._get_default_headers())
         
-        async with self._session.request(method, url, *args, **kwargs) as response:
-            response.raise_for_status()
-            return await response.json()
+        retry_count = 0
+        last_exception = None
+        
+        while retry_count < MAX_RETRIES:
+            try:
+                async with self._session.request(method, url, *args, **kwargs) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                    
+                    # Cache the result for GET requests
+                    if method.upper() == "GET":
+                        self._request_cache[cache_key] = result
+                        self._cache_timestamps[cache_key] = time.time()
+                        
+                    return result
+                    
+            except aiohttp.ClientResponseError as e:
+                last_exception = e
+                # Handle specific error codes
+                if e.status == 401:  # Unauthorized
+                    logger.warning(f"Received 401 from {url}, attempting to refresh token")
+                    # Try to refresh the token if unauthorized
+                    if self._refresh_token and retry_count < MAX_RETRIES - 1:
+                        try:
+                            await self._refresh_access_token(self._refresh_token)
+                            # Update headers with new token
+                            headers.update(self._get_default_headers())
+                        except Exception as refresh_error:
+                            logger.error(f"Failed to refresh token: {refresh_error}")
+                            raise AuthenticationRequired("Authentication required after token refresh failed")
+                    else:
+                        raise AuthenticationRequired("Authentication required")
+                elif e.status >= 500:  # Server error, can retry
+                    retry_count += 1
+                    wait_time = RETRY_BACKOFF ** retry_count
+                    logger.warning(f"Server error {e.status} on attempt {retry_count}/{MAX_RETRIES}, retrying in {wait_time:.1f}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:  # Other client errors, can't retry
+                    logger.error(f"Client error: {e.status} - {e.message}")
+                    raise
+                    
+            except aiohttp.ClientConnectionError as e:
+                last_exception = e
+                retry_count += 1
+                wait_time = RETRY_BACKOFF ** retry_count
+                logger.warning(f"Connection error on attempt {retry_count}/{MAX_RETRIES}, retrying in {wait_time:.1f}s: {str(e)}")
+                await asyncio.sleep(wait_time)
+                
+            except aiohttp.ClientError as e:
+                logger.error(f"Request failed with client error: {str(e)}")
+                raise NetworkError(f"Network error: {str(e)}")
+                
+            except asyncio.TimeoutError:
+                last_exception = TimeoutError("Request timed out")
+                retry_count += 1
+                wait_time = RETRY_BACKOFF ** retry_count
+                logger.warning(f"Request timed out on attempt {retry_count}/{MAX_RETRIES}, retrying in {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+                
+            except Exception as e:
+                logger.exception(f"Unexpected error: {str(e)}")
+                raise BackendError(f"Unexpected error: {str(e)}")
+        
+        # If we got here, we've exhausted all retries
+        if isinstance(last_exception, asyncio.TimeoutError):
+            raise NetworkError("Request timed out after multiple retries")
+        elif last_exception:
+            raise BackendError(f"Request failed after {MAX_RETRIES} retries: {str(last_exception)}")
+        else:
+            raise BackendError(f"Request failed after {MAX_RETRIES} retries")
 
     async def get(self, url, *args, **kwargs):
         return await self._request("GET", url, *args, **kwargs)
@@ -60,75 +171,82 @@ class AuthenticatedHttpClient(HttpClient):
         return await self._request("POST", url, *args, **kwargs)
 
     async def _exchange_code_for_token(self, code: str):
-        token_url = "https://accounts.ea.com/connect/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        token_params = {
-            "token_format": "JWS",
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-            "grant_type": "authorization_code",
-            "redirect_uri": "qrc:///html/login_successful.html",
-            "code": code
-        }
-        try:
-            async with self._session.post(token_url, headers=headers, data=token_params) as response:
-                response.raise_for_status()
-                response_data = await response.json()
+        async with self._token_lock:
+            token_url = "https://accounts.ea.com/connect/token"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            token_params = {
+                "token_format": "JWS",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "grant_type": "authorization_code",
+                "redirect_uri": "qrc:///html/login_successful.html",
+                "code": code
+            }
             
-            if "access_token" not in response_data or "refresh_token" not in response_data:
-                logger.error(f"Invalid token response: {response_data}")
-                raise BackendError("Failed to exchange code for tokens: Invalid response")
-            
-            self._access_token = response_data["access_token"]
-            self._refresh_token = response_data["refresh_token"]
-            self._save_lats()
-            
-            logger.info("Successfully exchanged code for tokens")
-            return self._access_token, self._refresh_token
-        except aiohttp.ClientError as e:
-            logger.exception(f"Network error while exchanging code for tokens: {str(e)}")
-            raise NetworkError("Failed to exchange code for tokens due to network error")
-        except Exception as e:
-            logger.exception(f"Unexpected error while exchanging code for tokens: {str(e)}")
-            raise BackendError("Unexpected error while exchanging code for tokens")
+            try:
+                async with self._session.post(token_url, headers=headers, data=token_params) as response:
+                    response.raise_for_status()
+                    response_data = await response.json()
+                
+                if "access_token" not in response_data or "refresh_token" not in response_data:
+                    logger.error(f"Invalid token response: {response_data}")
+                    raise BackendError("Failed to exchange code for tokens: Invalid response")
+                
+                self._access_token = response_data["access_token"]
+                self._refresh_token = response_data["refresh_token"]
+                self._save_lats()
+                
+                logger.info("Successfully exchanged code for tokens")
+                return self._access_token, self._refresh_token
+                
+            except aiohttp.ClientError as e:
+                logger.exception(f"Network error while exchanging code for tokens: {str(e)}")
+                raise NetworkError("Failed to exchange code for tokens due to network error")
+                
+            except Exception as e:
+                logger.exception(f"Unexpected error while exchanging code for tokens: {str(e)}")
+                raise BackendError("Unexpected error while exchanging code for tokens")
 
     async def _refresh_access_token(self, refresh_token: str):
-        if not refresh_token:
-            raise AuthenticationRequired("No refresh token available")
-        
-        url = "https://accounts.ea.com/connect/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        params = {
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token
-        }
-        try:
-            logger.info("Using stored credentials to refresh the access token...")
-            async with self._session.post(url, headers=headers, data=params) as response:
-                response.raise_for_status()
-                data = await response.json()
+        async with self._token_lock:
+            if not refresh_token:
+                raise AuthenticationRequired("No refresh token available")
             
-            if "access_token" in data and "refresh_token" in data:
-                self._access_token = data["access_token"]
-                self._refresh_token = data["refresh_token"]
-                logger.info("Successfully refreshed the access token.")
-                self._save_lats()
-                return self._access_token, self._refresh_token
-            else:
-                raise BackendError("Failed to refresh token: Invalid response")
-
-        except aiohttp.ClientError as e:
-            logger.warning(f"Network error while refreshing token: {str(e)}")
-            raise NetworkError("Failed to refresh token due to network error")
-        except Exception as e:
-            logger.exception(f"Failed to refresh token: {str(e)}")
-            self._access_token = None
-            self._refresh_token = None
-            if self._auth_lost_callback:
-                self._auth_lost_callback()
-            raise AccessDenied("Failed to refresh token")
+            url = "https://accounts.ea.com/connect/token"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            params = {
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token
+            }
+            
+            try:
+                logger.info("Using stored credentials to refresh the access token...")
+                async with self._session.post(url, headers=headers, data=params) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                
+                if "access_token" in data and "refresh_token" in data:
+                    self._access_token = data["access_token"]
+                    self._refresh_token = data["refresh_token"]
+                    logger.info("Successfully refreshed the access token.")
+                    self._save_lats()
+                    return self._access_token, self._refresh_token
+                else:
+                    raise BackendError("Failed to refresh token: Invalid response")
+                    
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error while refreshing token: {str(e)}")
+                raise NetworkError("Failed to refresh token due to network error")
+                
+            except Exception as e:
+                logger.exception(f"Failed to refresh token: {str(e)}")
+                self._access_token = None
+                self._refresh_token = None
+                if self._auth_lost_callback:
+                    self._auth_lost_callback()
+                raise AccessDenied("Failed to refresh token")
 
     async def _get_access_token(self):
         url = "https://accounts.ea.com/connect/auth"
@@ -138,6 +256,7 @@ class AuthenticatedHttpClient(HttpClient):
             "response_type": "code",
             "redirectUri": "nucleus:rest"
         }
+        
         async with self._session.get(url, params=params, allow_redirects=False) as response:
             if "Location" in response.headers:
                 location = response.headers["Location"]
@@ -146,6 +265,7 @@ class AuthenticatedHttpClient(HttpClient):
                 elif "error=login_required" in location:
                     self._log_session_details()
                     raise AuthenticationRequired("Error obtaining authorization code. Must reauthenticate.")
+            
             self._save_lats()
             raise BackendError("Unexpected response during authorization")
 
@@ -175,3 +295,13 @@ class AuthenticatedHttpClient(HttpClient):
 
     def set_auth_lost_callback(self, callback):
         self._auth_lost_callback = callback
+        
+    def clear_cache(self):
+        """Clear the request cache"""
+        self._request_cache = {}
+        self._cache_timestamps = {}
+        
+    async def close(self):
+        """Close the HTTP session"""
+        if self._session and not self._session.closed:
+            await self._session.close()

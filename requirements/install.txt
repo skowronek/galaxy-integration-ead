@@ -1,13 +1,14 @@
-#use specific pip version for dependencies to work nicely
+# Use specific pip version
 pip==22.0.4
 pip-tools
 
-#protoc install.
+# Requests
 requests
 
-#install requirements. 
+# Core requirements
 invoke==1.2.0
 wheel
-psutil # look at the processes for games
+psutil
 
+# Galaxy plugin
 galaxy.plugin.api==0.69
